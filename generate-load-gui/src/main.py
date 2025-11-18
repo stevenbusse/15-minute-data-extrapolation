@@ -7,15 +7,18 @@ from PyQt5.QtWidgets import (
     QWidget,
     QPushButton,
     QLabel,
-    QLineEdit,
     QMessageBox,
-    QSplitter,
+    QComboBox,
+    QListWidget,
+    QListWidgetItem,
+    QFrame,
+    QDateEdit,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QDate, pyqtSignal
+from PyQt5.QtGui import QFont
 import sys
 import os
 import numpy as np
-import json
 import pandas as pd
 from pathlib import Path
 
@@ -31,6 +34,77 @@ import matplotlib
 matplotlib.use("Qt5Agg")
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
+
+class FileDropWidget(QFrame):
+    """Minimal drag-and-drop area that doubles as a browse button."""
+
+    fileSelected = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("FileDrop")
+        self.setAcceptDrops(True)
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setCursor(Qt.PointingHandCursor)
+        self._path = ""
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(6)
+        layout.setAlignment(Qt.AlignCenter)
+
+        self.title = QLabel("Load profile")
+        self.title.setAlignment(Qt.AlignCenter)
+        self.hint = QLabel("Drop CSV/XLSX here\nor click to browse")
+        self.hint.setAlignment(Qt.AlignCenter)
+        self.hint.setObjectName("FileDropHint")
+        self.path_label = QLabel("No file selected")
+        self.path_label.setAlignment(Qt.AlignCenter)
+        self.path_label.setObjectName("FileDropPath")
+
+        layout.addWidget(self.title)
+        layout.addWidget(self.hint)
+        layout.addWidget(self.path_label)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                self.set_path(url.toLocalFile())
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.open_file_dialog()
+        super().mousePressEvent(event)
+
+    def open_file_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select input CSV/Excel",
+            "",
+            "CSV/Excel (*.csv *.xlsx *.xls);;All Files (*)",
+        )
+        if path:
+            self.set_path(path)
+
+    def set_path(self, path: str):
+        self._path = path
+        name = os.path.basename(path)
+        self.path_label.setText(name if name else "No file selected")
+        self.fileSelected.emit(path)
+
+    def current_path(self) -> str:
+        return self._path
+
 
 class DraggableScatter:
     """Simple draggable vertical-only scatter.
@@ -131,59 +205,70 @@ class DraggableScatter:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("15-minute Load Extrapolator — Curve Editor")
-        self.resize(1100, 700)
+        self.setWindowTitle("15-minute Load Extrapolator")
+        self.resize(1200, 820)
+        self.selected_input_path = ""
 
-        # Minimal UI: only input browse and Run button as requested
+        base_font = QFont("Segoe UI", 10)
+        self.setFont(base_font)
+        self.setStyleSheet(
+            """
+            QWidget {
+                font-family: 'Segoe UI';
+                font-size: 11pt;
+                color: #1f2430;
+            }
+            QFrame#Card {
+                background: #f7f8fb;
+                border: 1px solid #d9dce5;
+                border-radius: 14px;
+            }
+            QFrame#FileDrop {
+                border: 1px dashed #9ba5be;
+                border-radius: 14px;
+                background: #fff;
+            }
+            QLabel#FileDropHint {
+                color: #6b7287;
+                font-size: 10pt;
+            }
+            QLabel#FileDropPath {
+                color: #3c3f51;
+                font-weight: 600;
+            }
+            QPushButton {
+                border-radius: 8px;
+                padding: 10px 18px;
+                background-color: #3c7ae5;
+                color: white;
+                border: none;
+            }
+            QPushButton#Secondary {
+                background-color: #eef1f7;
+                color: #1f2430;
+            }
+            QPushButton:disabled {
+                background-color: #a5b4d4;
+            }
+            QComboBox, QDateEdit {
+                border: 1px solid #c9ccdb;
+                border-radius: 8px;
+                padding: 6px 10px;
+                background: white;
+            }
+            QListWidget {
+                border: 1px solid #e1e2ea;
+                border-radius: 10px;
+                padding: 6px;
+                background: white;
+            }
+            """
+        )
+
         main = QWidget()
         main_layout = QVBoxLayout(main)
-
-        self.input_field = QLineEdit()
-        btn_in = QPushButton("Browse input")
-        btn_in.clicked.connect(self.browse_input)
-
-        # preset buttons
-        presets_layout = QHBoxLayout()
-        btn_preset_home = QPushButton("Preset: Home")
-        btn_preset_home.clicked.connect(lambda: self.load_preset("home"))
-        btn_preset_office = QPushButton("Preset: Office")
-        btn_preset_office.clicked.connect(lambda: self.load_preset("office"))
-        btn_preset_multi = QPushButton("Preset: Multi")
-        btn_preset_multi.clicked.connect(lambda: self.load_preset("multi"))
-        presets_layout.addWidget(btn_preset_home)
-        presets_layout.addWidget(btn_preset_office)
-        presets_layout.addWidget(btn_preset_multi)
-
-        btn_run = QPushButton("Run")
-        btn_run.clicked.connect(self.run_and_export)
-
-        main_layout.addWidget(QLabel("Input file:"))
-        main_layout.addWidget(self.input_field)
-        main_layout.addWidget(btn_in)
-        main_layout.addLayout(presets_layout)
-
-        # optional start date and config fields
-        extra_row = QHBoxLayout()
-        extra_row.addWidget(QLabel("Start date (YYYY-MM-DD, optional):"))
-        self.start_field = QLineEdit()
-        self.start_field.setPlaceholderText("e.g. 2024-01-01")
-        extra_row.addWidget(self.start_field)
-
-        extra_row.addWidget(QLabel("Config (optional):"))
-        self.config_field = QLineEdit()
-        extra_row.addWidget(self.config_field)
-        btn_cfg = QPushButton("Browse config")
-        def browse_cfg():
-            p, _ = QFileDialog.getOpenFileName(self, "Select config JSON", "", "JSON (*.json);;All Files (*)")
-            if p:
-                self.config_field.setText(p)
-        btn_cfg.clicked.connect(browse_cfg)
-        extra_row.addWidget(btn_cfg)
-
-        main_layout.addLayout(extra_row)
-        main_layout.addStretch(1)
-        main_layout.addWidget(btn_run)
-
+        main_layout.setContentsMargins(18, 18, 18, 18)
+        main_layout.setSpacing(14)
         self.setCentralWidget(main)
 
         # hold loaded series (filled during run)
@@ -193,26 +278,94 @@ class MainWindow(QMainWindow):
 
         # add interactive editors below controls
         # create a small area with two plots
-        fig1 = Figure(figsize=(6, 2.5))
+        graphs_frame = QFrame()
+        graphs_frame.setObjectName("Card")
+        graphs_layout = QHBoxLayout(graphs_frame)
+        graphs_layout.setContentsMargins(12, 12, 12, 12)
+        graphs_layout.setSpacing(12)
+
+        fig1 = Figure(figsize=(5.5, 2.8))
         ax_daily = fig1.add_subplot(111)
-        ax_daily.set_title("Daily multiplier (hours)")
+        ax_daily.set_title("Daily multiplier (hours)", loc="left")
         ax_daily.set_xlim(0, 24)
-        ax_daily.set_ylim(0, 5.0)
+        ax_daily.set_ylim(0, 3.0)
         ax_daily.set_xlabel("Hour of day")
         ax_daily.set_ylabel("Multiplier")
-        canvas1 = FigureCanvas(fig1)
 
-        fig2 = Figure(figsize=(6, 2.5))
+        fig2 = Figure(figsize=(5.5, 2.8))
         ax_month = fig2.add_subplot(111)
-        ax_month.set_title("Monthly multipliers")
+        ax_month.set_title("Monthly multipliers", loc="left")
         ax_month.set_xlim(1, 12)
-        ax_month.set_ylim(0, 5.0)
+        ax_month.set_ylim(0, 3.0)
         ax_month.set_xlabel("Month")
         ax_month.set_ylabel("Multiplier")
-        canvas2 = FigureCanvas(fig2)
 
-        main_layout.addWidget(canvas1)
-        main_layout.addWidget(canvas2)
+        for ax in (ax_daily, ax_month):
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.grid(True, color="#e6e8f2", linewidth=0.6, linestyle="-", alpha=0.8)
+
+        canvas1 = FigureCanvas(fig1)
+        canvas2 = FigureCanvas(fig2)
+        self.ax_daily = ax_daily
+        self.ax_month = ax_month
+
+        graphs_layout.addWidget(canvas1, 1)
+        graphs_layout.addWidget(canvas2, 1)
+        main_layout.addWidget(graphs_frame, 2)
+
+        controls = QFrame()
+        controls.setObjectName("Card")
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(16, 16, 16, 16)
+        controls_layout.setSpacing(12)
+
+        file_row = QHBoxLayout()
+        file_row.setSpacing(12)
+        self.file_drop = FileDropWidget()
+        self.file_drop.fileSelected.connect(self.handle_file_selected)
+        file_row.addWidget(self.file_drop, 2)
+
+        preset_col = QVBoxLayout()
+        preset_col.setSpacing(6)
+        preset_label = QLabel("Curve presets")
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItem("Choose preset…", "")
+        self.preset_combo.addItem("Home", "home")
+        self.preset_combo.addItem("Office", "office")
+        self.preset_combo.addItem("Multi-use", "multi")
+        self.preset_combo.currentIndexChanged.connect(self.on_preset_changed)
+        preset_col.addWidget(preset_label)
+        preset_col.addWidget(self.preset_combo)
+        file_row.addLayout(preset_col, 1)
+
+        controls_layout.addLayout(file_row)
+
+        start_row = QHBoxLayout()
+        start_row.setSpacing(12)
+        start_label = QLabel("Start date")
+        self.start_date_edit = QDateEdit()
+        self.start_date_edit.setCalendarPopup(True)
+        start_year = QDate.currentDate().year()
+        self.start_date_edit.setDate(QDate(start_year, 1, 1))
+        self.start_date_edit.setDisplayFormat("MM/dd/yyyy")
+        start_row.addWidget(start_label)
+        start_row.addWidget(self.start_date_edit)
+        start_row.addStretch(1)
+
+        self.run_button = QPushButton("Generate extrapolated year")
+        self.run_button.clicked.connect(self.run_and_export)
+        start_row.addWidget(self.run_button)
+        controls_layout.addLayout(start_row)
+
+        log_label = QLabel("Recent files")
+        self.file_log = QListWidget()
+        self.file_log.setMaximumHeight(120)
+        self.file_log.itemDoubleClicked.connect(self.on_recent_file_activated)
+        controls_layout.addWidget(log_label)
+        controls_layout.addWidget(self.file_log)
+
+        main_layout.addWidget(controls, 1)
 
         # initial editor points
         daily_hours = np.array([0.0, 6.0, 12.0, 18.0, 23.75])
@@ -220,20 +373,24 @@ class MainWindow(QMainWindow):
         month_x = np.arange(1, 13)
         month_y = np.ones_like(month_x, dtype=float)
 
-        self.daily_editor = DraggableScatter(ax_daily, daily_hours, daily_y, callback=self.update_daily_curve, color="C1")
-        self.monthly_editor = DraggableScatter(ax_month, month_x, month_y, callback=self.update_monthly_curve, color="C2")
+        self.daily_baseline = ax_daily.axhline(1.0, color="#b6bccf", linestyle="--", linewidth=1.0, zorder=1)
+        self.monthly_baseline = ax_month.axhline(1.0, color="#b6bccf", linestyle="--", linewidth=1.0, zorder=1)
 
-        self.daily_curve_line, = ax_daily.plot([], [], lw=2, color="C0")
-        self.monthly_curve_line, = ax_month.plot([], [], lw=2, color="C3")
+        self.daily_editor = DraggableScatter(
+            ax_daily, daily_hours, daily_y, callback=self.update_daily_curve, color="#ff8c42"
+        )
+        self.monthly_editor = DraggableScatter(
+            ax_month, month_x, month_y, callback=self.update_monthly_curve, color="#5a9bd4"
+        )
+
+        self.daily_curve_line, = ax_daily.plot([], [], lw=2.4, color="#1f4f8d")
+        self.monthly_curve_line, = ax_month.plot([], [], lw=2.4, color="#8c4cd9")
 
         # draw initial curves
         self.update_daily_curve()
         self.update_monthly_curve()
-
-    def browse_input(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select input CSV/Excel", "", "CSV/Excel (*.csv *.xlsx *.xls);;All Files (*)")
-        if path:
-            self.input_field.setText(path)
+        self.run_button.setEnabled(False)
+        self.statusBar().showMessage("Drop a load profile to begin")
 
     def update_daily_curve(self):
         """Redraw the daily curve line from the draggable editor points."""
@@ -245,7 +402,9 @@ class MainWindow(QMainWindow):
         series = gl.evaluate_daily_curve(daily_pts)
         # convert times to hours for plotting (0..24)
         hours = [t.hour + t.minute / 60.0 for t in series.index]
-        self.daily_curve_line.set_data(hours, series.values)
+        values = series.values
+        self.daily_curve_line.set_data(hours, values)
+        self._set_axis_limits(self.ax_daily, values)
         self.daily_curve_line.figure.canvas.draw_idle()
 
     def update_monthly_curve(self):
@@ -269,24 +428,63 @@ class MainWindow(QMainWindow):
         xs = np.linspace(1.0, 12.0, 240)
         ys = gl.cubic_hermite_interpolate(months, mults, xs)
         self.monthly_curve_line.set_data(xs, ys)
+        self._set_axis_limits(self.ax_month, ys)
         self.monthly_curve_line.figure.canvas.draw_idle()
 
+    def _set_axis_limits(self, ax, values):
+        if values is None or len(values) == 0:
+            return
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0:
+            return
+        finite_vals = arr[np.isfinite(arr)]
+        if finite_vals.size == 0:
+            return
+        peak = float(np.nanmax(finite_vals))
+        top = max(3.0, peak * 1.2)
+        ax.set_ylim(0, top)
+
+    def handle_file_selected(self, path: str):
+        path = path.strip()
+        self.selected_input_path = path
+        has_path = bool(path)
+        self.run_button.setEnabled(has_path)
+        if not has_path:
+            self.statusBar().showMessage("Please select a load profile")
+            return
+
+        display_name = Path(path).name
+        # remove duplicates
+        for i in range(self.file_log.count()):
+            item = self.file_log.item(i)
+            if item.data(Qt.UserRole) == path:
+                self.file_log.takeItem(i)
+                break
+
+        item = QListWidgetItem(display_name)
+        item.setData(Qt.UserRole, path)
+        item.setToolTip(path)
+        self.file_log.insertItem(0, item)
+        self.file_log.setCurrentItem(item)
+        self.statusBar().showMessage(f"Ready — {display_name}")
+
+    def on_recent_file_activated(self, item):
+        path = item.data(Qt.UserRole)
+        if path:
+            self.file_drop.set_path(path)
+
+    def on_preset_changed(self, index: int):
+        key = self.preset_combo.itemData(index)
+        if key:
+            self.load_preset(str(key))
 
     def run_and_export(self):
-        inp = self.input_field.text().strip()
+        inp = self.selected_input_path.strip()
         if not inp:
             QMessageBox.warning(self, "No input", "Choose an input file first")
             return
 
-        # parse optional start date from UI
-        start_date = None
-        sd_text = self.start_field.text().strip() if hasattr(self, 'start_field') else ""
-        if sd_text:
-            try:
-                start_date = pd.to_datetime(sd_text)
-            except Exception:
-                QMessageBox.warning(self, "Start date", "Start date not recognised — expected YYYY-MM-DD. Ignoring.")
-                start_date = None
+        start_date = pd.Timestamp(self.start_date_edit.date().toPyDate())
 
         try:
             series = gl.load_input_data(Path(inp), start_date)
@@ -323,74 +521,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Generation error", str(e))
 
-    def load_config_into_editors(self):
-        cfg = self.config_field.text().strip()
-        if not cfg:
-            QMessageBox.warning(self, "No config", "Choose a config JSON first")
-            return
-        try:
-            with open(cfg, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception as e:
-            QMessageBox.critical(self, "Config error", f"Failed to read JSON: {e}")
-            return
-
-        # daily points expected: list of {time: "HH:MM", multiplier: float}
-        dpts = data.get("daily_curve_points", [])
-        if dpts:
-            mult = []
-            for item in dpts[:5]:
-                try:
-                    minutes = gl.parse_time_string(item["time"])
-                    mult.append(float(item.get("multiplier", 1.0)))
-                except Exception:
-                    continue
-            if len(mult) >= 1:
-                x = self.daily_editor.x
-                ys = (mult + [1.0] * (len(x) - len(mult)))[:len(x)]
-                self.daily_editor.update_y(ys)
-                self.update_daily_curve()
-
-        mpts = data.get("monthly_curve_points", [])
-        if mpts:
-            multm = []
-            for item in mpts:
-                try:
-                    multm.append(float(item.get("multiplier", 1.0)))
-                except Exception:
-                    continue
-            if len(multm) >= 1:
-                ys = (multm + [1.0] * (12 - len(multm)))[:12]
-                self.monthly_editor.update_y(ys)
-                self.update_monthly_curve()
-
-        QMessageBox.information(self, "Config loaded", "Config loaded into editors (if values present).")
-
-
-    def save_current_config(self):
-        cfg = self.config_field.text().strip()
-        if not cfg:
-            cfg, _ = QFileDialog.getSaveFileName(self, "Save config JSON", "", "JSON (*.json);;All Files (*)")
-            if not cfg:
-                return
-            self.config_field.setText(cfg)
-
-        daily = [
-            {"time": f"{int(h):02d}:{int((h-int(h))*60):02d}", "multiplier": float(v)}
-            for h, v in self.daily_editor.get_points()
-        ]
-        monthly = [
-            {"month": int(m), "multiplier": float(v)}
-            for m, v in self.monthly_editor.get_points()
-        ]
-        payload = {"daily_curve_points": daily, "monthly_curve_points": monthly}
-        try:
-            with open(cfg, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2)
-            QMessageBox.information(self, "Saved", f"Config saved to {cfg}")
-        except Exception as e:
-            QMessageBox.critical(self, "Save error", str(e))
-
     def load_preset(self, name: str):
         presets = {
             "home": {
@@ -416,7 +546,7 @@ class MainWindow(QMainWindow):
         self.update_daily_curve()
         self.monthly_editor.update_y(my)
         self.update_monthly_curve()
-        QMessageBox.information(self, "Preset loaded", f"Loaded preset: {name}")
+        self.statusBar().showMessage(f"Preset '{name}' applied")
 
 
 if __name__ == "__main__":
