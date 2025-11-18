@@ -1,0 +1,22 @@
+# VS Code
+.vscode/
+
+# Python virtual envs
+generate-load-gui/.venv/
+generate-load-gui/.venv311/
+
+# Python cache
+__pycache__/
+generate-load-gui/src/__pycache__/
+generate-load-gui/src/gui/__pycache__/
+*/__pycache__/
+
+# Build / output
+out/
+dist/
+build/
+
+# Logs
+*.log
+generate-load-gui/gui_error.log
+generate-load-gui/gui_error.lognotepad

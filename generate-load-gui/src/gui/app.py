@@ -2,7 +2,27 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QVBoxLayout,
 import sys
 import json
 from pathlib import Path
-from generate_load import main  # Assuming main is the function to run the load generation logic
+import os, sys, subprocess
+
+def run_cli(input_path, output_path, year=None, start_date=None, config_path=None, preview=True):
+    # Resolve the path to the CLI script we want to call
+    # Here we call the *root* CLI (recommended). If you prefer the GUI copy, point at src/generate_load.py instead.
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    cli_script = os.path.join(repo_root, "generate_load.py")  # root CLI that you already verified works
+
+    cmd = [sys.executable, cli_script, "--input", input_path, "--output", output_path]
+    if year:
+        cmd += ["--year", str(year)]
+    if start_date:
+        cmd += ["--start-date", start_date]
+    if config_path:
+        cmd += ["--config", config_path]
+    if preview:
+        cmd += ["--preview"]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return proc.returncode, proc.stdout, proc.stderr
+
 
 class LoadProfileApp(QMainWindow):
     def __init__(self):

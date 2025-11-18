@@ -46,10 +46,18 @@ python src/main.py
 
 Follow the on-screen instructions to load your data, adjust the curves, and generate the load profile.
 
+## Building a standalone executable (Windows)
+
+See `BUILD_EXE.md` for a short guide using PyInstaller. In short:
+
+- Install the GUI requirements (use a virtualenv).
+- Install PyInstaller and run `pyinstaller pyinstaller.spec` from the `generate-load-gui` folder.
+- Test the resulting `dist/generate-load-gui` folder on a clean Windows machine and include Qt platform plugins if needed.
+
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a pull request for any enhancements or bug fixes.
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+This project is licensed under the MIT License. See the LICENSE file for details.   

@@ -144,6 +144,102 @@ def load_input_data(path: Path, start_date: pd.Timestamp | None) -> pd.Series:
     return load_series
 
 
+def load_input_data_robust(path: Path, start_date: pd.Timestamp | None = None) -> pd.Series:
+    """Robust loader that accepts irregular or incomplete 15-minute data.
+
+    This function tries harder to locate/parse timestamps and numeric columns,
+    handles duplicates by averaging, resamples onto a strict 15-minute grid
+    between the minimum and maximum timestamps, and interpolates/fills
+    missing values so downstream code receives a clean quarter-hour series.
+    """
+
+    suffix = path.suffix.lower()
+    if suffix in {".xls", ".xlsx", ".xlsm"}:
+        df = pd.read_excel(path)
+    else:
+        df = pd.read_csv(path)
+
+    if df.empty:
+        raise ValueError("Input file does not contain any data.")
+
+    # Try to find or construct a datetime index.
+    tscol = None
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            tscol = col
+            break
+    if tscol is None:
+        for col in df.columns:
+            if col.lower() in {"timestamp", "datetime", "date", "time"}:
+                tscol = col
+                break
+
+    # If still not found, attempt coercion and pick the best candidate.
+    if tscol is None:
+        best = None
+        best_count = 0
+        for col in df.columns:
+            coerced = pd.to_datetime(df[col], errors="coerce")
+            nonnull = int(coerced.notna().sum())
+            if nonnull > best_count:
+                best = col
+                best_count = nonnull
+        if best is not None and best_count >= max(1, len(df) // 4):
+            # require at least 25% parseability to consider it a timestamp column
+            tscol = best
+
+    if tscol is not None:
+        df[tscol] = pd.to_datetime(df[tscol], errors="coerce")
+        df = df.loc[~df[tscol].isna()].copy()
+        df = df.set_index(tscol)
+        # If there are duplicate timestamps, average them
+        if df.index.duplicated().any():
+            df = df.groupby(df.index).mean()
+    else:
+        # No timestamp column; synthesize index from provided start_date or Jan 1
+        if start_date is None:
+            start_date = pd.Timestamp(pd.Timestamp.now().year, 1, 1)
+        df.index = pd.date_range(start=start_date, periods=len(df), freq="15min")
+
+    # Choose numeric column: prefer numeric dtypes, otherwise coerce and pick best
+    numeric_columns = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+    chosen_col = None
+    if numeric_columns:
+        chosen_col = numeric_columns[0]
+    else:
+        coerced = df.apply(lambda c: pd.to_numeric(c, errors="coerce"))
+        nonnull_counts = coerced.notna().sum()
+        if nonnull_counts.max() > 0:
+            chosen_col = nonnull_counts.idxmax()
+            df[chosen_col] = coerced[chosen_col]
+
+    if chosen_col is None:
+        raise ValueError("No numeric column found in the input data.")
+
+    series = df[chosen_col].astype(float).sort_index()
+
+    # If the data has irregular spacing, resample from min to max on a strict 15T grid
+    start = series.index.min()
+    end = series.index.max()
+    full_index = pd.date_range(start=start, end=end, freq="15min")
+
+    # Align to the new index, interpolate and fill edges
+    series = series.reindex(series.index.union(full_index))
+    # interpolate in time where possible
+    series = series.sort_index().interpolate(method="time")
+    series = series.reindex(full_index)
+    series = series.fillna(method="ffill").fillna(method="bfill")
+
+    # final check: ensure index is strict 15T
+    try:
+        series.index = ensure_quarter_hour_index(series.index)
+    except Exception:
+        # if something still odd, coerce to the requested full_index
+        series.index = full_index
+
+    return series
+
+
 def infer_start_year(series: pd.Series) -> int:
     """Determine the year to synthesize.  Prefer the first year in the data."""
 
@@ -302,15 +398,27 @@ def synthesize_full_year(
     year: int,
 ) -> pd.Series:
     """Create the full-year 15 minute series."""
-
+    # Build an index that covers every 15-minute slot in the requested year.
+    # Use an exclusive end at Jan 1 of the following year to avoid YearEnd edge cases.
     start = pd.Timestamp(year=year, month=1, day=1, hour=0, minute=0)
-    end = start + pd.offsets.YearEnd()
-    index = pd.date_range(start=start, end=end + pd.Timedelta(minutes=15), freq="15min", inclusive="left")
+    end_exclusive = pd.Timestamp(year=year + 1, month=1, day=1, hour=0, minute=0)
+    # Some pandas versions do not support the ``closed`` keyword on
+    # ``pd.date_range``. To remain compatible, subtract one 15-minute step
+    # from the exclusive end and generate an inclusive range instead.
+    end_adj = end_exclusive - pd.Timedelta(minutes=15)
+    index = pd.date_range(start=start, end=end_adj, freq="15min")
 
-    base_values = index.map(lambda ts: base_profile[ts.time()])
-    daily_values = index.map(lambda ts: daily_curve[ts.time()])
-    monthly_values = index.map(lambda ts: monthly_curve[ts.month])
-    monthly_adj_values = index.map(lambda ts: monthly_adjustment.get(ts.month, 1.0))
+    # Vectorized lookups for speed and robustness.  Reindexing a small Series
+    # is cheaper than calling a lambda for every timestamp.
+    times = index.time
+    months = index.month
+
+    base_values = base_profile.reindex(times).to_numpy()
+    daily_values = daily_curve.reindex(times).to_numpy()
+    monthly_values = monthly_curve.reindex(months).to_numpy()
+    monthly_adj_values = (
+        monthly_adjustment.reindex(months, fill_value=1.0).to_numpy()
+    )
 
     load = base_values * daily_values * monthly_values * monthly_adj_values
     return pd.Series(load, index=index)
