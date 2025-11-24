@@ -113,12 +113,14 @@ class DraggableScatter:
     A callback is invoked after each drag event.
     """
 
-    def __init__(self, ax, x, y, callback=None, fmt="o", color="C0"):
+    def __init__(self, ax, x, y, callback=None, fmt="o", color="C0", y_min=0.01, y_max=5.0):
         self.ax = ax
         self.canvas = ax.figure.canvas
         self.x = np.array(x, dtype=float)
         self.y = np.array(y, dtype=float)
         self.callback = callback
+        self.y_min = y_min
+        self.y_max = y_max
 
         # Draw initial scatter points
         self.scatter = ax.scatter(
@@ -147,16 +149,15 @@ class DraggableScatter:
 
     def on_press(self, event):
         """Handle mouse press: find nearest point within click radius."""
-        if event.inaxes != self.ax:
+        if event.inaxes != self.ax or event.x is None or event.y is None:
             return
 
-        xy = np.column_stack([self.x, self.y])
-        d = np.hypot(
-            (xy[:, 0] - event.xdata),
-            (xy[:, 1] - event.ydata)
-        )
+        # measure distance in screen pixels for stable picking across scales
+        xy_disp = self.ax.transData.transform(np.column_stack([self.x, self.y]))
+        click = np.array([event.x, event.y])
+        d = np.linalg.norm(xy_disp - click, axis=1)
         idx = int(np.argmin(d))
-        if d[idx] < 0.5:
+        if d[idx] <= 12.0:  # 12 px tolerance
             self._ind = idx
 
     def on_motion(self, event):
@@ -169,8 +170,12 @@ class DraggableScatter:
         except Exception:
             return
 
-        # Clamp range to reasonable multiplier bounds
-        new_y = max(0.01, min(5.0, val))
+        # Clamp range to reasonable bounds
+        new_y = val
+        if self.y_min is not None:
+            new_y = max(self.y_min, new_y)
+        if self.y_max is not None:
+            new_y = min(self.y_max, new_y)
         self.y[self._ind] = new_y
 
         # Update scatter graphics
@@ -190,11 +195,21 @@ class DraggableScatter:
 
     def update_y(self, y):
         """Update all Y values and redraw the scatter plot."""
-        self.y = np.array(y, dtype=float)
+        arr = np.array(y, dtype=float)
+        if self.y_min is not None:
+            arr = np.maximum(arr, self.y_min)
+        if self.y_max is not None:
+            arr = np.minimum(arr, self.y_max)
+        self.y = arr
         self.scatter.set_offsets(
             np.column_stack([self.x, self.y])
         )
         self.canvas.draw_idle()
+
+    def set_limits(self, y_min=None, y_max=None):
+        """Set drag bounds for y values."""
+        self.y_min = y_min
+        self.y_max = y_max
 
     def get_points(self):
         """Return list of (x, y) tuples."""
@@ -311,7 +326,19 @@ class MainWindow(QMainWindow):
         self.ax_month = ax_month
 
         graphs_layout.addWidget(canvas1, 1)
-        graphs_layout.addWidget(canvas2, 1)
+
+        month_container = QWidget()
+        month_layout = QVBoxLayout(month_container)
+        month_layout.setContentsMargins(0, 0, 0, 0)
+        month_layout.setSpacing(6)
+        self.month_mode_combo = QComboBox()
+        self.month_mode_combo.addItem("Multiplier", "multiplier")
+        self.month_mode_combo.addItem("kWh target", "kwh")
+        self.month_mode_combo.currentIndexChanged.connect(self.on_month_mode_changed)
+        month_layout.addWidget(self.month_mode_combo, 0, Qt.AlignLeft)
+        month_layout.addWidget(canvas2, 1)
+
+        graphs_layout.addWidget(month_container, 1)
         main_layout.addWidget(graphs_frame, 2)
 
         controls = QFrame()
@@ -373,6 +400,11 @@ class MainWindow(QMainWindow):
         month_x = np.arange(1, 13)
         month_y = np.ones_like(month_x, dtype=float)
 
+        self.month_mode = "multiplier"
+        self.month_multiplier_values = month_y.copy()
+        # start kWh targets at 2,000 kWh/month unless we can infer later
+        self.month_kwh_values = np.full_like(month_y, 2000.0, dtype=float)
+
         self.daily_baseline = ax_daily.axhline(1.0, color="#b6bccf", linestyle="--", linewidth=1.0, zorder=1)
         self.monthly_baseline = ax_month.axhline(1.0, color="#b6bccf", linestyle="--", linewidth=1.0, zorder=1)
 
@@ -380,7 +412,7 @@ class MainWindow(QMainWindow):
             ax_daily, daily_hours, daily_y, callback=self.update_daily_curve, color="#ff8c42"
         )
         self.monthly_editor = DraggableScatter(
-            ax_month, month_x, month_y, callback=self.update_monthly_curve, color="#5a9bd4"
+            ax_month, month_x, month_y, callback=self.update_monthly_curve, color="#5a9bd4", y_min=0.0, y_max=5.0
         )
 
         self.daily_curve_line, = ax_daily.plot([], [], lw=2.4, color="#1f4f8d")
@@ -391,6 +423,10 @@ class MainWindow(QMainWindow):
         self.update_monthly_curve()
         self.run_button.setEnabled(False)
         self.statusBar().showMessage("Drop a load profile to begin")
+
+    def _update_run_enabled(self):
+        """Enable run when a file is selected or when kWh mode is active."""
+        self.run_button.setEnabled(bool(self.selected_input_path) or self.month_mode == "kwh")
 
     def update_daily_curve(self):
         """Redraw the daily curve line from the draggable editor points."""
@@ -427,11 +463,19 @@ class MainWindow(QMainWindow):
             mults = np.append(mults, mults[-1])
         xs = np.linspace(1.0, 12.0, 240)
         ys = gl.cubic_hermite_interpolate(months, mults, xs)
+        # persist current edits per mode
+        if self.month_mode == "multiplier":
+            self.month_multiplier_values = mults.copy()
+        else:
+            self.month_kwh_values = mults.copy()
         self.monthly_curve_line.set_data(xs, ys)
-        self._set_axis_limits(self.ax_month, ys)
+        if self.month_mode == "kwh":
+            self._set_axis_limits(self.ax_month, ys, min_floor=4000, max_ceiling=12000)
+        else:
+            self._set_axis_limits(self.ax_month, ys)
         self.monthly_curve_line.figure.canvas.draw_idle()
 
-    def _set_axis_limits(self, ax, values):
+    def _set_axis_limits(self, ax, values, min_floor=None, max_ceiling=None):
         if values is None or len(values) == 0:
             return
         arr = np.asarray(values, dtype=float)
@@ -441,16 +485,68 @@ class MainWindow(QMainWindow):
         if finite_vals.size == 0:
             return
         peak = float(np.nanmax(finite_vals))
-        top = max(3.0, peak * 1.2)
+        top = peak * 1.2 if peak > 0 else (max_ceiling or 1.0)
+        if min_floor is not None:
+            top = max(min_floor, top)
+        if max_ceiling is not None:
+            top = min(max_ceiling, top)
         ax.set_ylim(0, top)
+
+    def _get_month_values(self) -> np.ndarray:
+        pts = sorted(self.monthly_editor.get_points(), key=lambda p: p[0])
+        if not pts:
+            return np.ones(12, dtype=float)
+        return np.array([v for _, v in pts], dtype=float)
+
+    def estimate_month_targets(self) -> np.ndarray:
+        """Rough guess for kWh targets from loaded data."""
+        if self.loaded_series is not None and len(self.loaded_series) > 0:
+            # convert 15-min power values to energy by multiplying by 0.25h
+            month_energy = self.loaded_series.resample("M").sum() * 0.25
+            month_energy.index = month_energy.index.month
+            values = np.full(12, float(month_energy.mean() or 1.0))
+            for m in range(1, 13):
+                if m in month_energy.index:
+                    values[m - 1] = float(month_energy.loc[m])
+            return values
+        return np.full(12, 2000.0, dtype=float)
+
+    def on_month_mode_changed(self, _index=None):
+        # Preserve current edits before switching modes
+        current_vals = self._get_month_values()
+        if self.month_mode == "multiplier":
+            self.month_multiplier_values = current_vals
+        else:
+            self.month_kwh_values = current_vals
+
+        self.month_mode = self.month_mode_combo.currentData()
+        if self.month_mode == "kwh":
+            if self.month_kwh_values is None:
+                self.month_kwh_values = self.estimate_month_targets()
+            next_vals = self.month_kwh_values
+            self.ax_month.set_ylabel("kWh target")
+            self._set_axis_limits(self.ax_month, next_vals, min_floor=4000, max_ceiling=12000)
+            # allow pulling beyond 10k; clamp drag at a higher bound but not too loose
+            self.monthly_editor.set_limits(0.0, 12000.0)
+            self.statusBar().showMessage("Editing monthly kWh targets")
+        else:
+            next_vals = self.month_multiplier_values
+            self.ax_month.set_ylabel("Multiplier")
+            self.ax_month.set_ylim(0, 5.0)
+            self.monthly_editor.set_limits(0.0, 5.0)
+            self.statusBar().showMessage("Editing monthly multipliers")
+
+        self.monthly_editor.update_y(next_vals)
+        self.update_monthly_curve()
+        self._update_run_enabled()
 
     def handle_file_selected(self, path: str):
         path = path.strip()
         self.selected_input_path = path
         has_path = bool(path)
-        self.run_button.setEnabled(has_path)
+        self._update_run_enabled()
         if not has_path:
-            self.statusBar().showMessage("Please select a load profile")
+            self.statusBar().showMessage("Please select a load profile (or switch to kWh mode)")
             return
 
         display_name = Path(path).name
@@ -480,37 +576,86 @@ class MainWindow(QMainWindow):
 
     def run_and_export(self):
         inp = self.selected_input_path.strip()
-        if not inp:
-            QMessageBox.warning(self, "No input", "Choose an input file first")
-            return
-
         start_date = pd.Timestamp(self.start_date_edit.date().toPyDate())
 
-        try:
-            series = gl.load_input_data(Path(inp), start_date)
-        except Exception:
+        # Load input if provided; allow kWh-only mode without a file.
+        if inp:
             try:
-                series = gl.load_input_data_robust(Path(inp), start_date)
-                QMessageBox.information(self, "Input cleaned",
-                                        "Input timestamps were irregular or missing — the file was automatically cleaned and resampled to 15-minute spacing.")
-            except Exception as e2:
-                QMessageBox.critical(self, "Load error", f"Failed to load input file:\n{e2}")
+                series = gl.load_input_data(Path(inp), start_date)
+            except Exception:
+                try:
+                    series = gl.load_input_data_robust(Path(inp), start_date)
+                    QMessageBox.information(self, "Input cleaned",
+                                            "Input timestamps were irregular or missing — the file was automatically cleaned and resampled to 15-minute spacing.")
+                except Exception as e2:
+                    QMessageBox.critical(self, "Load error", f"Failed to load input file:\n{e2}")
+                    return
+        else:
+            if self.month_mode != "kwh":
+                QMessageBox.warning(self, "No input", "Choose an input file first (required in multiplier mode)")
                 return
+            # No file and kWh mode: fabricate a neutral series placeholder.
+            series = None
 
         try:
-            base_profile = gl.build_time_of_day_profile(series)
-            monthly_adjustment = gl.compute_monthly_adjustment(series, base_profile)
             # build curves from current editor points
             daily_pts = [gl.DailyCurvePoint(int(round(h * 60)), float(m)) for h, m in self.daily_editor.get_points()]
-            monthly_pts = [gl.MonthlyCurvePoint(int(m), float(v)) for m, v in self.monthly_editor.get_points()]
             daily_curve = gl.evaluate_daily_curve(daily_pts)
-            monthly_curve = gl.evaluate_monthly_curve(monthly_pts)
-            year = gl.infer_start_year(series)
+            month_vals = self._get_month_values()
+            if self.month_mode == "multiplier":
+                monthly_pts = [
+                    gl.MonthlyCurvePoint(int(idx + 1), float(val)) for idx, val in enumerate(month_vals)
+                ]
+                monthly_curve = gl.evaluate_monthly_curve(monthly_pts)
+                monthly_kwh_targets = None
+            else:
+                monthly_curve = pd.Series(1.0, index=pd.Index(range(1, 13), name="month"))
+                monthly_kwh_targets = {int(idx + 1): float(val) for idx, val in enumerate(month_vals)}
 
-            full = gl.synthesize_full_year(base_profile, daily_curve, monthly_curve, monthly_adjustment, year)
+            if series is None:
+                # Neutral base and adjustment when no input file in kWh mode.
+                base_profile = pd.Series(1.0, index=daily_curve.index)
+                monthly_adjustment = pd.Series(1.0, index=pd.RangeIndex(1, 13))
+                year = start_date.year
+            else:
+                base_profile = gl.build_time_of_day_profile(series)
+                monthly_adjustment = gl.compute_monthly_adjustment(series, base_profile)
+                year = gl.infer_start_year(series)
 
-            inp_path = Path(inp)
-            out_path = inp_path.with_name(inp_path.stem + "_extrapolated.xlsx")
+            full = gl.synthesize_full_year(
+                base_profile,
+                daily_curve,
+                monthly_curve,
+                monthly_adjustment,
+                year,
+                monthly_kwh_targets=monthly_kwh_targets,
+            )
+
+            if self.month_mode == "kwh":
+                baseline_energy = gl.estimate_monthly_baseline_energy(
+                    base_profile=base_profile,
+                    daily_curve=daily_curve,
+                    monthly_adjustment=monthly_adjustment,
+                    year=year,
+                    use_proportional_daily=True,
+                )
+                implied = []
+                for month_idx in range(1, 13):
+                    target = monthly_kwh_targets.get(month_idx, 0.0)
+                    base_val = float(baseline_energy.get(month_idx, np.nan))
+                    if base_val and base_val != 0:
+                        implied.append(target / base_val)
+                    else:
+                        implied.append(1.0)
+                monthly_curve = pd.Series(implied, index=pd.Index(range(1, 13), name="month"))
+
+            if inp:
+                inp_path = Path(inp)
+                out_path = inp_path.with_name(inp_path.stem + "_extrapolated.xlsx")
+            else:
+                out_dir = Path("out")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / "kwh_extrapolated.xlsx"
             if out_path.exists():
                 resp = QMessageBox.question(self, "Overwrite?", f"{out_path}\n\nFile exists. Overwrite?", QMessageBox.Yes | QMessageBox.No)
                 if resp != QMessageBox.Yes:

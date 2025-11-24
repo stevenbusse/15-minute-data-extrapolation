@@ -396,6 +396,7 @@ def synthesize_full_year(
     monthly_curve: pd.Series,
     monthly_adjustment: pd.Series,
     year: int,
+    monthly_kwh_targets: dict[int, float] | None = None,
 ) -> pd.Series:
     """Create the full-year 15 minute series."""
     # Build an index that covers every 15-minute slot in the requested year.
@@ -420,8 +421,103 @@ def synthesize_full_year(
         monthly_adjustment.reindex(months, fill_value=1.0).to_numpy()
     )
 
-    load = base_values * daily_values * monthly_values * monthly_adj_values
+    if monthly_kwh_targets:
+        # Precompute daily weights from the daily curve (96 slots sum to 1).
+        daily_sum = float(daily_curve.sum())
+        if daily_sum == 0 or np.isnan(daily_sum):
+            normalized_daily = np.ones_like(daily_curve.values) / len(daily_curve)
+        else:
+            normalized_daily = daily_curve.values / daily_sum
+        # Slight deterministic variation across days to avoid perfectly flat months.
+        # 2% swing over the month.
+        load = np.zeros_like(base_values)
+        # build date index aligned to slots
+        dates = pd.Series(index).dt.normalize().to_numpy()
+        for month in range(1, 13):
+            if month not in monthly_kwh_targets:
+                continue
+            try:
+                target_val = float(monthly_kwh_targets[month])
+            except Exception:
+                continue
+            mask = months == month
+            if not np.any(mask):
+                continue
+            # all days in this month
+            month_dates = pd.unique(dates[mask])
+            day_count = len(month_dates)
+            if day_count == 0:
+                continue
+            # day weights with slight ripple
+            day_idx = np.arange(day_count, dtype=float)
+            day_weights = 1.0 + 0.02 * np.sin(2 * np.pi * day_idx / max(day_count, 1))
+            day_weights = day_weights / day_weights.sum()
+            # energy per day
+            day_targets = target_val * day_weights
+            # fill slots for each day
+            for d, day in enumerate(month_dates):
+                day_mask = mask & (dates == day)
+                slots = int(np.sum(day_mask))
+                if slots == 0:
+                    continue
+                # repeat normalized daily profile across the day's slots (96 expected)
+                weights = np.resize(normalized_daily, slots)
+                weights_sum = weights.sum()
+                if weights_sum == 0 or np.isnan(weights_sum):
+                    weights = np.full(slots, 1.0 / slots)
+                else:
+                    weights = weights / weights_sum
+                # distribute day's energy target across slots
+                load[day_mask] = day_targets[d] * weights
+        # Final correction per month to hit exact kWh (sum of slot energies = target)
+        for month, target in monthly_kwh_targets.items():
+            mask = months == month
+            if not np.any(mask):
+                continue
+            current = float(np.sum(load[mask]))
+            try:
+                target_val = float(target)
+            except Exception:
+                continue
+            if current and np.isfinite(current) and current != 0:
+                load[mask] *= target_val / current
+    else:
+        base = base_values * daily_values * monthly_adj_values
+        load = base * monthly_values
+
     return pd.Series(load, index=index)
+
+
+def estimate_monthly_baseline_energy(
+    base_profile: pd.Series,
+    daily_curve: pd.Series,
+    monthly_adjustment: pd.Series,
+    year: int,
+    use_proportional_daily: bool = False,
+) -> pd.Series:
+    """Estimate month energy (in input units * hours) without monthly multipliers."""
+    start = pd.Timestamp(year=year, month=1, day=1, hour=0, minute=0)
+    end_exclusive = pd.Timestamp(year=year + 1, month=1, day=1, hour=0, minute=0)
+    end_adj = end_exclusive - pd.Timedelta(minutes=15)
+    index = pd.date_range(start=start, end=end_adj, freq="15min")
+    times = index.time
+    months = index.month
+    base_values = base_profile.reindex(times).to_numpy()
+    daily_values = daily_curve.reindex(times).to_numpy()
+    if use_proportional_daily:
+        daily_sum = float(daily_curve.sum())
+        if daily_sum == 0 or np.isnan(daily_sum):
+            daily_values = np.ones_like(daily_values)
+        else:
+            daily_values = daily_values / daily_sum * len(daily_curve)
+    monthly_adj_values = (
+        monthly_adjustment.reindex(months, fill_value=1.0).to_numpy()
+    )
+    base = base_values * daily_values * monthly_adj_values
+    df = pd.DataFrame({"month": months, "base": base})
+    month_energy = df.groupby("month")["base"].sum() * 0.25
+    month_energy = month_energy.reindex(range(1, 13), fill_value=np.nan)
+    return month_energy
 
 
 def load_configuration(path: Path | None) -> tuple[List[DailyCurvePoint], List[MonthlyCurvePoint]]:
