@@ -20,3 +20,20 @@ build/
 *.log
 generate-load-gui/gui_error.log
 generate-load-gui/gui_error.lognotepad
+# Python venv
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# PyInstaller output
+/build/
+dist/
+*.spec
+
+# IDE junk
+.vscode/
+.idea/
